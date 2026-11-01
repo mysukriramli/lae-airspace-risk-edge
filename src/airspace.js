@@ -1,9 +1,4 @@
-/**
- * Embedded Global Hub Reference Points (Instant Local Edge Resolution)
- * Bypasses network overhead for high-density global hubs.
- */
 const GLOBAL_CORE_AERODROMES = [
-  // Southeast Asia & East Asia
   { id: "WMSA", name: "Subang Sultan Abdul Aziz Shah", lat: 3.1306, lon: 101.5497, radiusKm: 9.26 },
   { id: "WMKK", name: "Kuala Lumpur International (KLIA)", lat: 2.7456, lon: 101.7099, radiusKm: 9.26 },
   { id: "WSSS", name: "Singapore Changi Airport", lat: 1.3644, lon: 103.9915, radiusKm: 9.26 },
@@ -11,18 +6,15 @@ const GLOBAL_CORE_AERODROMES = [
   { id: "VTBS", name: "Bangkok Suvarnabhumi Airport", lat: 13.6900, lon: 100.7501, radiusKm: 9.26 },
   { id: "VHHH", name: "Hong Kong Chek Lap Kok", lat: 22.3080, lon: 113.9185, radiusKm: 9.26 },
   { id: "RJTT", name: "Tokyo Haneda International", lat: 35.5494, lon: 139.7798, radiusKm: 9.26 },
-  // Europe
   { id: "EGLL", name: "London Heathrow", lat: 51.4700, lon: -0.4543, radiusKm: 9.26 },
   { id: "LFPG", name: "Paris Charles de Gaulle", lat: 49.0097, lon: 2.5479, radiusKm: 9.26 },
   { id: "EDDF", name: "Frankfurt Main", lat: 50.0379, lon: 8.5622, radiusKm: 9.26 },
   { id: "EHAM", name: "Amsterdam Schiphol", lat: 52.3105, lon: 4.7683, radiusKm: 9.26 },
-  // North America
   { id: "KJFK", name: "New York John F. Kennedy", lat: 40.6413, lon: -73.7781, radiusKm: 9.26 },
   { id: "KLAX", name: "Los Angeles International", lat: 33.9416, lon: -118.4085, radiusKm: 9.26 },
   { id: "KORD", name: "Chicago O'Hare International", lat: 41.9742, lon: -87.9073, radiusKm: 9.26 },
   { id: "KATL", name: "Atlanta Hartsfield-Jackson", lat: 33.6407, lon: -84.4277, radiusKm: 9.26 },
   { id: "KSFO", name: "San Francisco International", lat: 37.6213, lon: -122.3790, radiusKm: 9.26 },
-  // Middle East & Oceania
   { id: "OMDB", name: "Dubai International", lat: 25.2532, lon: 55.3657, radiusKm: 9.26 },
   { id: "OTHH", name: "Hamad International (Doha)", lat: 25.2731, lon: 51.6081, radiusKm: 9.26 },
   { id: "YSSY", name: "Sydney Kingsford Smith", lat: -33.9399, lon: 151.1753, radiusKm: 9.26 }
@@ -42,16 +34,31 @@ function haversineKm(lat1, lon1, lat2, lon2) {
 }
 
 /**
- * Universal Global Airspace Authority
- * Step 1: Sub-millisecond lookup against embedded global aerodrome index.
- * Step 2: Dynamic fallback against the global NOAA ICAO Aerodrome Service.
- * Step 3: Enforces fail-safe status if external verification is unreachable.
+ * Queries terrain surface elevation (meters Above Mean Sea Level) via open DEM.
+ */
+export async function getTerrainElevationM(lat, lon) {
+  const url = `https://api.open-meteo.com/v1/elevation?latitude=${lat}&longitude=${lon}`;
+  try {
+    const res = await fetch(url, {
+      headers: { "User-Agent": "LAE-Airspace-Risk-Edge/2.2" },
+      cf: { cacheTtl: 86400 * 14, cacheEverything: true }
+    });
+    if (!res.ok) return 0.0;
+    const data = await res.json();
+    return data.elevation?.[0] ?? 0.0;
+  } catch {
+    return 0.0;
+  }
+}
+
+/**
+ * Universal Global Airspace Authority.
+ * Evaluates against embedded core hubs, then falls back to dynamic NOAA ICAO registry.
  */
 export async function checkAirspaceRestrictions(lat, lon, altitudeAglM) {
-  const ICAO_CTR_RADIUS_KM = 9.26; // 5 Nautical Miles standard control zone
-  const ICAO_CTR_CEILING_M = 1000; // 3,000 ft AGL standard CTR ceiling
+  const ICAO_CTR_RADIUS_KM = 9.26;
+  const ICAO_CTR_CEILING_M = 1000;
 
-  // Pass 1: Local In-Memory Matrix (0 ms latency)
   for (const port of GLOBAL_CORE_AERODROMES) {
     const dist = haversineKm(lat, lon, port.lat, port.lon);
     if (dist <= port.radiusKm && altitudeAglM <= ICAO_CTR_CEILING_M) {
@@ -67,7 +74,6 @@ export async function checkAirspaceRestrictions(lat, lon, altitudeAglM) {
     }
   }
 
-  // Pass 2: Dynamic Worldwide NOAA Bounding Box Resolution
   const latDelta = 0.16;
   const lonDelta = 0.16 / Math.max(0.2, Math.cos(lat * (Math.PI / 180)));
   const minLat = (lat - latDelta).toFixed(4);
@@ -79,7 +85,7 @@ export async function checkAirspaceRestrictions(lat, lon, altitudeAglM) {
 
   try {
     const res = await fetch(endpoint, {
-      headers: { "User-Agent": "LAE-Airspace-Risk-Edge/2.0" },
+      headers: { "User-Agent": "LAE-Airspace-Risk-Edge/2.2" },
       cf: { cacheTtl: 21600, cacheEverything: true }
     });
 
@@ -107,6 +113,7 @@ export async function checkAirspaceRestrictions(lat, lon, altitudeAglM) {
           };
         }
       }
+
       return {
         status: "UNCONTROLLED",
         zone_id: null,
@@ -117,11 +124,8 @@ export async function checkAirspaceRestrictions(lat, lon, altitudeAglM) {
         source: "DYNAMIC_NOAA_ICAO_REGISTRY"
       };
     }
-  } catch {
-    // If upstream network fails, check distance to nearest coordinates
-  }
+  } catch {}
 
-  // Pass 3: Safe Neutral Fallback
   return {
     status: "UNCONTROLLED_PROVISIONAL",
     zone_id: null,
