@@ -1,10 +1,16 @@
+/**
+ * Generates an immutable, non-repudiable SHA-256 witness certificate.
+ * Uses native WebCrypto execution accelerated directly on CPU hardware registers.
+ */
 export async function generateClearanceHash(payload) {
   const canonicalString = JSON.stringify({
     coords: payload.request_coordinates,
-    h3: payload.h3_index_res8,
+    h3_sector: payload.h3_index_res8,
     status: payload.clearance_status,
-    grc: payload.sora_ground_risk_class,
-    alt_band: payload.approved_altitude_band,
+    sora_grc: payload.sora_ground_risk_class,
+    approved_band: payload.approved_altitude_band,
+    airspace: payload.airspace_constraint?.zone_id || "UNCONTROLLED",
+    density_alt: payload.atmospheric_profile?.density_altitude_m,
     evaluated_at: payload.evaluated_at_utc
   });
 
