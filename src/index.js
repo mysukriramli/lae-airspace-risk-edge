@@ -19,9 +19,9 @@ const CORS_HEADERS = {
 const H3_RES = 8; // ~460m hexagonal sector diameter
 
 /**
- * Deterministic Clearance Engine Core
+ * Evaluates single waypoint clearance against airspace, weather, density altitude, and SORA GRC
  */
-async function evaluatePointClearance(lat, lon, params) {
+async function evaluatePointClearance(lat, lon, params = {}) {
   const h3Cell = latLngToCell(lat, lon, H3_RES);
   const altRequested = parseFloat(params.alt_m || "60");
   const droneMassKg = parseFloat(params.drone_mass_kg || "5.5");
@@ -136,6 +136,62 @@ async function evaluatePointClearance(lat, lon, params) {
   return payload;
 }
 
+/**
+ * Evaluates batch flight corridor trajectory with concurrent H3 sector resolution
+ */
+async function evaluateCorridorClearance(waypoints, altRequested = 60, mass = 5.5, maxWind = 12.0, maxGust = 16.2) {
+  // Deduplicate waypoints sharing identical H3 resolution 8 cells (~460m)
+  const uniqueCells = new Map();
+  for (const wp of waypoints) {
+    const cell = latLngToCell(wp[0], wp[1], H3_RES);
+    if (!uniqueCells.has(cell)) {
+      uniqueCells.set(cell, { lat: wp[0], lon: wp[1], cell });
+    }
+  }
+
+  // Parallel resolution of all unique corridor cells
+  const cellPromises = Array.from(uniqueCells.values()).map(item =>
+    evaluatePointClearance(item.lat, item.lon, {
+      alt_m: altRequested,
+      drone_mass_kg: mass,
+      max_wind_limit_ms: maxWind,
+      max_gust_limit_ms: maxGust
+    })
+  );
+
+  const corridorResults = await Promise.all(cellPromises);
+
+  let overallCleared = true;
+  let bottleneckReason = null;
+  let bottleneckStatus = "CLEARED_CORRIDOR";
+
+  for (const res of corridorResults) {
+    if (res.clearance_status !== "CLEARED_GREEN") {
+      overallCleared = false;
+      bottleneckStatus = res.clearance_status;
+      bottleneckReason = res.operational_reasoning;
+      break;
+    }
+  }
+
+  return {
+    corridor_status: overallCleared ? "CLEARED_CORRIDOR" : "DENIED_CORRIDOR",
+    bottleneck_status: overallCleared ? null : bottleneckStatus,
+    bottleneck_reason: bottleneckReason,
+    total_waypoints_submitted: waypoints.length,
+    unique_h3_sectors_evaluated: corridorResults.length,
+    segments: corridorResults,
+    corridor_witness_hash: await generateClearanceHash({
+      request_coordinates: waypoints[0],
+      h3_index_res8: Array.from(uniqueCells.keys()).join(":"),
+      clearance_status: overallCleared ? "CLEARED" : "DENIED",
+      sora_ground_risk_class: corridorResults[0]?.sora_ground_risk_class || "GRC_1",
+      approved_altitude_band: overallCleared ? { min: 20, max: altRequested } : null,
+      evaluated_at_utc: new Date().toISOString()
+    })
+  };
+}
+
 export default {
   async fetch(request, env, ctx) {
     if (request.method === "OPTIONS") return new Response(null, { headers: CORS_HEADERS });
@@ -143,12 +199,179 @@ export default {
     const url = new URL(request.url);
     const { pathname, searchParams } = url;
 
-    // Discovery Manifest for Autonomous Agents & MCP Tool Discovery
+    // 1. Model Context Protocol (MCP) JSON-RPC 2.0 Handler
+    if (pathname === "/mcp" && request.method === "POST") {
+      try {
+        const rpc = await request.json();
+        const { id, method, params } = rpc;
+
+        // MCP Handshake: initialize
+        if (method === "initialize") {
+          return new Response(JSON.stringify({
+            jsonrpc: "2.0",
+            id,
+            result: {
+              protocolVersion: "2024-11-05",
+              capabilities: {
+                tools: {}
+              },
+              serverInfo: {
+                name: "lae-airspace-risk-edge",
+                version: "2.0.0"
+              }
+            }
+          }), { headers: CORS_HEADERS });
+        }
+
+        // MCP Notification: initialized
+        if (method === "notifications/initialized") {
+          return new Response(null, { status: 204, headers: CORS_HEADERS });
+        }
+
+        // MCP Ping
+        if (method === "ping") {
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id, result: {} }), { headers: CORS_HEADERS });
+        }
+
+        // MCP Tool Catalog: tools/list
+        if (method === "tools/list") {
+          return new Response(JSON.stringify({
+            jsonrpc: "2.0",
+            id,
+            result: {
+              tools: [
+                {
+                  name: "evaluate_airspace_clearance",
+                  description: "Evaluates low-altitude flight clearance at a specific coordinate. Computes aerodrome restriction zones, Hellmann wind shear profiles, density altitude penalties, and JARUS SORA kinetic ground risk.",
+                  inputSchema: {
+                    type: "object",
+                    properties: {
+                      lat: { type: "number", description: "Target latitude in decimal degrees." },
+                      lon: { type: "number", description: "Target longitude in decimal degrees." },
+                      alt_m: { type: "number", default: 60, description: "Planned flight altitude AGL in meters." },
+                      drone_mass_kg: { type: "number", default: 5.5, description: "Aircraft all-up takeoff mass in kg." },
+                      max_wind_limit_ms: { type: "number", default: 12.0, description: "Max certified steady wind rating in m/s." },
+                      max_gust_limit_ms: { type: "number", description: "Max certified peak gust threshold in m/s (defaults to 1.35x wind limit)." },
+                      terrain: { type: "string", enum: ["water", "open_field", "suburban", "urban_canyon"], default: "suburban" }
+                    },
+                    required: ["lat", "lon"]
+                  }
+                },
+                {
+                  name: "evaluate_corridor_clearance",
+                  description: "Evaluates an entire flight corridor trajectory over an array of waypoints. Deduplicates identical H3 spatial sectors and returns a unified corridor GO/NO-GO clearance with cryptographic witness proof.",
+                  inputSchema: {
+                    type: "object",
+                    properties: {
+                      waypoints: {
+                        type: "array",
+                        items: {
+                          type: "array",
+                          items: { type: "number" },
+                          minItems: 2,
+                          maxItems: 2
+                        },
+                        description: "Array of [lat, lon] coordinates forming the planned trajectory."
+                      },
+                      alt_m: { type: "number", default: 60, description: "Planned flight altitude AGL in meters." },
+                      drone_mass_kg: { type: "number", default: 5.5, description: "Aircraft all-up mass in kg." },
+                      max_wind_limit_ms: { type: "number", default: 12.0, description: "Max vehicle steady wind limit in m/s." }
+                    },
+                    required: ["waypoints"]
+                  }
+                }
+              ]
+            }
+          }), { headers: CORS_HEADERS });
+        }
+
+        // MCP Tool Execution: tools/call
+        if (method === "tools/call") {
+          const toolName = params?.name;
+          const args = params?.arguments || {};
+
+          if (toolName === "evaluate_airspace_clearance") {
+            if (typeof args.lat !== "number" || typeof args.lon !== "number") {
+              return new Response(JSON.stringify({
+                jsonrpc: "2.0",
+                id,
+                error: { code: -32602, message: "Invalid params: 'lat' and 'lon' are required numbers." }
+              }), { status: 400, headers: CORS_HEADERS });
+            }
+
+            const result = await evaluatePointClearance(args.lat, args.lon, args);
+            return new Response(JSON.stringify({
+              jsonrpc: "2.0",
+              id,
+              result: {
+                content: [
+                  {
+                    type: "text",
+                    text: JSON.stringify(result, null, 2)
+                  }
+                ]
+              }
+            }), { headers: CORS_HEADERS });
+          }
+
+          if (toolName === "evaluate_corridor_clearance") {
+            const waypoints = args.waypoints;
+            if (!Array.isArray(waypoints) || waypoints.length === 0) {
+              return new Response(JSON.stringify({
+                jsonrpc: "2.0",
+                id,
+                error: { code: -32602, message: "Invalid params: 'waypoints' must be an array of [lat, lon]." }
+              }), { status: 400, headers: CORS_HEADERS });
+            }
+
+            const altRequested = args.alt_m || 60;
+            const mass = args.drone_mass_kg || 5.5;
+            const maxWind = args.max_wind_limit_ms || 12.0;
+            const maxGust = args.max_gust_limit_ms || (maxWind * 1.35);
+
+            const result = await evaluateCorridorClearance(waypoints, altRequested, mass, maxWind, maxGust);
+            return new Response(JSON.stringify({
+              jsonrpc: "2.0",
+              id,
+              result: {
+                content: [
+                  {
+                    type: "text",
+                    text: JSON.stringify(result, null, 2)
+                  }
+                ]
+              }
+            }), { headers: CORS_HEADERS });
+          }
+
+          return new Response(JSON.stringify({
+            jsonrpc: "2.0",
+            id,
+            error: { code: -32601, message: `Tool '${toolName}' not found.` }
+          }), { status: 404, headers: CORS_HEADERS });
+        }
+
+        return new Response(JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          error: { code: -32600, message: `Unsupported method '${method}'.` }
+        }), { status: 400, headers: CORS_HEADERS });
+
+      } catch (err) {
+        return new Response(JSON.stringify({
+          jsonrpc: "2.0",
+          error: { code: -32700, message: `Parse error: ${err.message}` }
+        }), { status: 500, headers: CORS_HEADERS });
+      }
+    }
+
+    // 2. Discovery Manifest for Autonomous Agents & Web Crawlers
     if (pathname === "/" || pathname === "/llms.txt") {
       return new Response(JSON.stringify({
         service: "lae-airspace-risk-edge",
         version: "2.0.0",
         purpose: "Worldwide Low-Altitude Economy Mission Clearance Authority",
+        mcp_endpoint: "POST /mcp",
         decision_states: [
           "CLEARED_GREEN",
           "DENIED_RESTRICTED_AIRSPACE",
@@ -159,6 +382,7 @@ export default {
           "DEFER_TELEMETRY_UNAVAILABLE"
         ],
         endpoints: {
+          mcp_json_rpc: "POST /mcp",
           single_clearance: "GET /v1/clearance?lat={lat}&lon={lon}&alt_m={alt}&drone_mass_kg={mass}&max_wind_limit_ms={limit}",
           corridor_clearance: "POST /v1/clearance-corridor"
         },
@@ -166,7 +390,7 @@ export default {
       }, null, 2), { headers: CORS_HEADERS });
     }
 
-    // Single Waypoint Evaluation
+    // 3. REST Single Waypoint Clearance Verification
     if (pathname === "/v1/clearance" && request.method === "GET") {
       const lat = parseFloat(searchParams.get("lat"));
       const lon = parseFloat(searchParams.get("lon"));
@@ -214,7 +438,7 @@ export default {
       return res;
     }
 
-    // High-Concurrency Route Corridor Batch Evaluation
+    // 4. REST High-Concurrency Flight Corridor Batch Evaluation
     if (pathname === "/v1/clearance-corridor" && request.method === "POST") {
       try {
         const body = await request.json();
@@ -231,56 +455,8 @@ export default {
           });
         }
 
-        // Deduplicate waypoints sharing identical H3 resolution 8 cells (~460m)
-        const uniqueCells = new Map();
-        for (const wp of waypoints) {
-          const cell = latLngToCell(wp[0], wp[1], H3_RES);
-          if (!uniqueCells.has(cell)) {
-            uniqueCells.set(cell, { lat: wp[0], lon: wp[1], cell });
-          }
-        }
-
-        // Parallel resolution of all corridor cells
-        const cellPromises = Array.from(uniqueCells.values()).map(item =>
-          evaluatePointClearance(item.lat, item.lon, {
-            alt_m: altRequested,
-            drone_mass_kg: mass,
-            max_wind_limit_ms: maxWind,
-            max_gust_limit_ms: maxGust
-          })
-        );
-
-        const corridorResults = await Promise.all(cellPromises);
-
-        let overallCleared = true;
-        let bottleneckReason = null;
-        let bottleneckStatus = "CLEARED_CORRIDOR";
-
-        for (const res of corridorResults) {
-          if (res.clearance_status !== "CLEARED_GREEN") {
-            overallCleared = false;
-            bottleneckStatus = res.clearance_status;
-            bottleneckReason = res.operational_reasoning;
-            break;
-          }
-        }
-
-        return new Response(JSON.stringify({
-          corridor_status: overallCleared ? "CLEARED_CORRIDOR" : "DENIED_CORRIDOR",
-          bottleneck_status: overallCleared ? null : bottleneckStatus,
-          bottleneck_reason: bottleneckReason,
-          total_waypoints_submitted: waypoints.length,
-          unique_h3_sectors_evaluated: corridorResults.length,
-          segments: corridorResults,
-          corridor_witness_hash: await generateClearanceHash({
-            request_coordinates: waypoints[0],
-            h3_index_res8: Array.from(uniqueCells.keys()).join(":"),
-            clearance_status: overallCleared ? "CLEARED" : "DENIED",
-            sora_ground_risk_class: corridorResults[0]?.sora_ground_risk_class || "GRC_1",
-            approved_altitude_band: overallCleared ? { min: 20, max: altRequested } : null,
-            evaluated_at_utc: new Date().toISOString()
-          })
-        }, null, 2), { headers: CORS_HEADERS });
+        const corridorEvaluation = await evaluateCorridorClearance(waypoints, altRequested, mass, maxWind, maxGust);
+        return new Response(JSON.stringify(corridorEvaluation, null, 2), { headers: CORS_HEADERS });
       } catch (err) {
         return new Response(JSON.stringify({ error: "Malformed corridor payload", details: err.message }), {
           status: 400,
@@ -289,6 +465,6 @@ export default {
       }
     }
 
-    return new Response(JSON.stringify({ error: "Route not found" }), { status: 404, headers: CORS_HEADERS });
+    return new Response(JSON.stringify({ error: "Endpoint not found" }), { status: 404, headers: CORS_HEADERS });
   }
 };
