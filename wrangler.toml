@@ -1,5 +1,5 @@
 name = "lae-airspace-risk-edge"
-main = "src/worker.js"
+main = "src/index.js"
 compatibility_date = "2026-10-30"
 compatibility_flags = ["nodejs_compat"]
 
