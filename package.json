@@ -1,7 +1,7 @@
 {
   "name": "lae-airspace-risk-edge",
-  "version": "2.2.0",
-  "description": "Enterprise Low-Altitude Economy (LAE) Mission Clearance Authority, 4D Spatiotemporal Deconfliction, and MCP Server",
+  "version": "3.0.0",
+  "description": "Production-grade Low-Altitude Economy (LAE) Traffic Management, Durable Object 4D Deconfliction, and In-Flight Conformance Authority",
   "main": "src/index.js",
   "type": "module",
   "scripts": {
