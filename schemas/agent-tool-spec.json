@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "function",
+  "function": {
+    "name": "evaluate_airspace_clearance",
+    "description": "Evaluates low-altitude flight clearances, Hellmann wind shear profiles, and JARUS SORA kinetic ground risk classes for autonomous drone dispatch and rerouting.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "lat": { "type": "number", "description": "Waypoint latitude in decimal degrees." },
+        "lon": { "type": "number", "description": "Waypoint longitude in decimal degrees." },
+        "alt_m": { "type": "number", "default": 60, "description": "Target flight altitude AGL in meters." },
+        "drone_mass_kg": { "type": "number", "default": 5.0, "description": "Total all-up aircraft take-off mass in kg." },
+        "max_wind_limit_ms": { "type": "number", "default": 12.0, "description": "Maximum certified vehicle crosswind resistance in m/s." },
+        "terrain": { "type": "string", "enum": ["water", "open_field", "suburban", "urban_canyon"], "default": "suburban" }
+      },
+      "required": ["lat", "lon"]
+    }
+  }
+}
