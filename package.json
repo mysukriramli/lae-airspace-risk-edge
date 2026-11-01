@@ -1,10 +1,19 @@
 {
   "name": "lae-airspace-risk-edge",
-  "version": "3.0.0",
-  "description": "Production-grade Low-Altitude Economy (LAE) Traffic Management, Durable Object 4D Deconfliction, and In-Flight Conformance Authority",
-  "main": "src/index.js",
+  "version": "3.1.0",
+  "description": "Deterministic Low-Altitude Airspace Clearance Authority & A* Corridor Engine",
+  "main": "src/core/engine.js",
   "type": "module",
+  "bin": {
+    "lae-airspace": "bin/mcp-stdio.js"
+  },
+  "exports": {
+    ".": "./src/core/engine.js",
+    "./routing": "./src/core/routing.js",
+    "./mavlink": "./src/core/mavlink.js"
+  },
   "scripts": {
+    "start": "node bin/mcp-stdio.js",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy"
   },
