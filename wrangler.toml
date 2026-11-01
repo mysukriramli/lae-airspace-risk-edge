@@ -4,6 +4,7 @@ compatibility_date = "2026-10-30"
 compatibility_flags = ["nodejs_compat"]
 
 [vars]
-SERVICE_VERSION = "1.0.0"
+SERVICE_VERSION = "2.2.0"
 ENVIRONMENT = "production"
-MAX_CORRIDOR_WAYPOINTS = "50"
+MAX_CORRIDOR_WAYPOINTS = "100"
+DEFAULT_ELEVATION_MASK_DEG = "10"
