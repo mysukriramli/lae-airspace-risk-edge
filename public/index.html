@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LAE Airspace Clearance Cockpit</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    body { margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0b0f19; color: #f3f4f6; display: flex; height: 100vh; }
+    #sidebar { width: 420px; background: #111827; padding: 20px; box-sizing: border-box; overflow-y: auto; border-right: 1px solid #1f2937; }
+    #map { flex: 1; height: 100%; }
+    h2 { font-size: 1.25rem; margin-top: 0; color: #38bdf8; display: flex; align-items: center; gap: 8px; }
+    .btn { background: #0284c7; color: white; border: none; padding: 12px; width: 100%; border-radius: 8px; font-weight: bold; cursor: pointer; margin-top: 10px; font-size: 0.95rem; }
+    .btn:hover { background: #0369a1; }
+    .card { background: #1f2937; border-radius: 8px; padding: 14px; margin-top: 15px; border-left: 4px solid #38bdf8; font-size: 0.85rem; }
+    .badge { display: inline-block; padding: 4px 10px; border-radius: 9999px; font-weight: bold; font-size: 0.75rem; }
+    .cleared { background: #065f46; color: #6ee7b7; border-left-color: #10b981; }
+    .denied { background: #7f1d1d; color: #fca5a5; border-left-color: #ef4444; }
+    .field { display: flex; justify-content: space-between; margin: 6px 0; border-bottom: 1px solid #374151; padding-bottom: 4px; }
+    .field span:first-child { color: #9ca3af; }
+    .hash { font-family: monospace; font-size: 0.75rem; word-break: break-all; color: #fbbf24; }
+    label { font-size: 0.8rem; color: #9ca3af; display: block; margin-top: 10px; }
+    input, select { width: 100%; padding: 8px; background: #374151; border: 1px solid #4b5563; border-radius: 6px; color: white; box-sizing: border-box; margin-top: 4px; }
+  </style>
+</head>
+<body>
+
+  <div id="sidebar">
+    <h2>🛸 LAE Airspace Authority</h2>
+    <p style="font-size: 0.8rem; color: #9ca3af;">Deterministic pre-flight risk clearance & SORA ground risk classification.</p>
+    
+    <label>Mission Preset Route</label>
+    <select id="routeSelect" onchange="loadPreset()">
+      <option value="shah_alam_klang">Shah Alam ➔ Klang (Nominal Corridor)</option>
+      <option value="subang_violation">Subang CTR Penetration (Airspace Violation)</option>
+    </select>
+
+    <label>Flight Altitude (m AGL)</label>
+    <input type="number" id="altInput" value="60" />
+
+    <label>Drone Mass (kg)</label>
+    <input type="number" id="massInput" value="4.5" />
+
+    <label>Vehicle Wind Limit (m/s)</label>
+    <input type="number" id="windInput" value="11.0" />
+
+    <button class="btn" onclick="evaluateMission()">⚡ Request Corridor Clearance</button>
+
+    <div id="resultsArea" style="display: none;">
+      <div id="statusCard" class="card">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+          <strong style="font-size: 1rem;">Clearance Verdict</strong>
+          <span id="statusBadge" class="badge"></span>
+        </div>
+        <div id="reasonText" style="margin-bottom: 10px; color: #d1d5db;"></div>
+        
+        <div class="field"><span>Altitude Band</span><span id="altBand">-</span></div>
+        <div class="field"><span>SORA Ground Risk</span><span id="grcClass">-</span></div>
+        <div class="field"><span>Wind @ Altitude</span><span id="windAtAlt">-</span></div>
+        <div class="field"><span>Kinetic Impact</span><span id="impactEnergy">-</span></div>
+        <div class="field"><span>Clearance Certificate</span></div>
+        <div id="certHash" class="hash">-</div>
+      </div>
+    </div>
+  </div>
+
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const map = L.map('map').setView([3.0738, 101.5183], 12);
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', { maxZoom: 19 }).addTo(map);
+
+    let routeLayer = L.layerGroup().addTo(map);
+
+    // Preset coordinates
+    const ROUTES = {
+      shah_alam_klang: [
+        [3.0738, 101.5183], // Shah Alam Sec 14
+        [3.0600, 101.4800], // Padang Jawa
+        [3.0440, 101.4460]  // Klang Town
+      ],
+      subang_violation: [
+        [3.0738, 101.5183],
+        [3.1150, 101.5400], // Piercing WMSA 5NM Ring
+        [3.1306, 101.5497]
+      ]
+    };
+
+    function loadPreset() {
+      const selected = document.getElementById("routeSelect").value;
+      const pts = ROUTES[selected];
+      routeLayer.clearLayers();
+
+      const polyline = L.polyline(pts, { color: '#38bdf8', weight: 4, dashArray: '6, 8' }).addTo(routeLayer);
+      pts.forEach((p, idx) => {
+        L.circleMarker(p, { radius: 6, color: '#0284c7', fillColor: '#38bdf8', fillOpacity: 1 })
+          .bindPopup(`Waypoint ${idx + 1}: [${p[0]}, ${p[1]}]`)
+          .addTo(routeLayer);
+      });
+      map.fitBounds(polyline.getBounds(), { padding: [50, 50] });
+    }
+
+    async function evaluateMission() {
+      const selected = document.getElementById("routeSelect").value;
+      const waypoints = ROUTES[selected];
+      const alt = parseFloat(document.getElementById("altInput").value);
+      const mass = parseFloat(document.getElementById("massInput").value);
+      const wind = parseFloat(document.getElementById("windInput").value);
+
+      const payload = {
+        alt_m: alt,
+        drone_mass_kg: mass,
+        max_wind_limit_ms: wind,
+        waypoints: waypoints
+      };
+
+      try {
+        const res = await fetch("https://lae-airspace-risk-edge.mysukriramli.workers.dev/v1/clearance-corridor", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+
+        const data = await res.json();
+        const resultsArea = document.getElementById("resultsArea");
+        const statusCard = document.getElementById("statusCard");
+        const statusBadge = document.getElementById("statusBadge");
+
+        resultsArea.style.display = "block";
+        statusCard.className = "card " + (data.corridor_status === "CLEARED_CORRIDOR" ? "cleared" : "denied");
+        statusBadge.className = "badge " + (data.corridor_status === "CLEARED_CORRIDOR" ? "cleared" : "denied");
+        statusBadge.innerText = data.corridor_status;
+
+        document.getElementById("reasonText").innerText = data.bottleneck_reason || "All corridor segments approved.";
+        
+        const seg = data.segments[0];
+        document.getElementById("altBand").innerText = seg.approved_altitude_band 
+          ? `${seg.approved_altitude_band.min_m}m - ${seg.approved_altitude_band.max_m}m AGL` 
+          : "N/A (Airspace Blocked)";
+        document.getElementById("grcClass").innerText = seg.sora_ground_risk_class || "-";
+        document.getElementById("windAtAlt").innerText = seg.aerodynamic_telemetry 
+          ? `${seg.aerodynamic_telemetry.calculated_wind_at_alt_ms} m/s` 
+          : "N/A";
+        document.getElementById("impactEnergy").innerText = seg.kinetic_impact_profile 
+          ? `${seg.kinetic_impact_profile.kinetic_impact_joules} Joules` 
+          : "N/A";
+        document.getElementById("certHash").innerText = data.corridor_hash || seg.mission_certificate;
+
+      } catch (err) {
+        alert("Worker offline or deployment pending: " + err.message);
+      }
+    }
+
+    loadPreset();
+  </script>
+</body>
+</html>
