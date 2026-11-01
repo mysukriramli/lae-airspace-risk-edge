@@ -2,6 +2,7 @@ import { latLngToCell } from "h3-js";
 import { calculateWindShear, calculateGroundRiskClass, resolveSafeAltitudeBand } from "./physics.js";
 import { fetchSurfaceAeroMeteo } from "./sensors.js";
 import { generateClearanceHash } from "./crypto.js";
+import { checkAirspaceRestrictions } from "./airspace.js";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -19,13 +20,32 @@ async function evaluatePointClearance(lat, lon, params) {
   const maxVehicleWindMs = parseFloat(params.max_wind_limit_ms || "12.0");
   const terrainType = params.terrain || "suburban";
 
+  // Step 1: Worldwide Airspace Restriction Check
+  const airspace = await checkAirspaceRestrictions(lat, lon, altRequested);
+
+  if (airspace.restricted) {
+    const deniedPayload = {
+      request_coordinates: { latitude: lat, longitude: lon },
+      h3_index_res8: h3Cell,
+      clearance_status: "DENIED_RESTRICTED_AIRSPACE",
+      operational_reasoning: `Flight intersects controlled aerodrome airspace: ${airspace.zone_name} (${airspace.zone_id}). Distance to center: ${airspace.distance_to_center_km} km (Separation required: ${airspace.minimum_separation_km} km).`,
+      reroute_required: true,
+      airspace_constraint: airspace,
+      approved_altitude_band: null,
+      evaluated_at_utc: new Date().toISOString()
+    };
+    deniedPayload.mission_certificate = await generateClearanceHash(deniedPayload);
+    return deniedPayload;
+  }
+
+  // Step 2: Atmospheric Telemetry & Aerodynamic Verification
   const meteo = await fetchSurfaceAeroMeteo(lat, lon);
   const windAtAlt = calculateWindShear(meteo.wind_speed_10m_ms, altRequested, terrainType);
   const sora = calculateGroundRiskClass(droneMassKg, "populated_urban");
   const viableBand = resolveSafeAltitudeBand(meteo.wind_speed_10m_ms, maxVehicleWindMs, terrainType);
 
   let status = "CLEARED_GREEN";
-  let reason = "All aerodynamic and kinetic parameters within certified limits.";
+  let reason = "All aerodynamic, airspace, and kinetic parameters within certified limits.";
   let rerouteRequired = false;
 
   if (windAtAlt > maxVehicleWindMs) {
@@ -46,6 +66,7 @@ async function evaluatePointClearance(lat, lon, params) {
     reroute_required: rerouteRequired,
     requested_altitude_agl_m: altRequested,
     approved_altitude_band: viableBand,
+    airspace_constraint: airspace,
     aerodynamic_telemetry: {
       surface_wind_ms: meteo.wind_speed_10m_ms,
       calculated_wind_at_alt_ms: windAtAlt,
@@ -72,27 +93,27 @@ export default {
     const url = new URL(request.url);
     const { pathname, searchParams } = url;
 
-    // Agent Discovery Manifest
+    // Root Agent Discovery Endpoint
     if (pathname === "/" || pathname === "/llms.txt") {
       return new Response(JSON.stringify({
         service: "lae-airspace-risk-edge",
         version: "1.0.0",
-        purpose: "Low-Altitude Economy (LAE) Pre-Flight Mission Clearance Authority",
+        purpose: "Worldwide Low-Altitude Airspace Clearance Authority",
         endpoints: {
-          single_clearance: "GET /v1/clearance?lat={lat}&lon={lon}&alt_m={alt}&drone_mass_kg={mass}&max_wind_limit_ms={limit}&terrain={suburban|urban_canyon}",
+          single_clearance: "GET /v1/clearance?lat={lat}&lon={lon}&alt_m={alt}&drone_mass_kg={mass}&max_wind_limit_ms={limit}",
           corridor_clearance: "POST /v1/clearance-corridor"
         },
-        regulatory_framework: "JARUS SORA v2.5 / GRC Matrix"
+        regulatory_framework: "ICAO Annex 2/11 CTR + JARUS SORA v2.5"
       }, null, 2), { headers: CORS_HEADERS });
     }
 
-    // 1. Single Point Clearance Evaluation
+    // 1. Single Waypoint Clearance Verification
     if (pathname === "/v1/clearance" && request.method === "GET") {
       const lat = parseFloat(searchParams.get("lat"));
       const lon = parseFloat(searchParams.get("lon"));
 
       if (isNaN(lat) || isNaN(lon)) {
-        return new Response(JSON.stringify({ error: "Missing required 'lat' and 'lon' query parameters" }), {
+        return new Response(JSON.stringify({ error: "Missing required query parameters: 'lat' and 'lon'" }), {
           status: 400,
           headers: CORS_HEADERS
         });
@@ -102,7 +123,7 @@ export default {
       const alt = searchParams.get("alt_m") || "60";
       const mass = searchParams.get("drone_mass_kg") || "5.0";
 
-      // Cloudflare Anycast In-Memory Edge Cache Match
+      // Cache lookup on edge node
       const cache = caches.default;
       const cacheUrl = new URL(`https://lae-cache.internal/cells/${h3Cell}?alt=${alt}&mass=${mass}`);
       const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
@@ -149,7 +170,7 @@ export default {
           });
         }
 
-        // De-duplicate waypoints sharing the exact same H3 Res-8 spatial cell
+        // Deduplicate waypoints sharing identical H3 resolution 8 cells
         const uniqueCells = new Map();
         for (const wp of waypoints) {
           const cell = latLngToCell(wp[0], wp[1], H3_RES);
@@ -199,6 +220,6 @@ export default {
       }
     }
 
-    return new Response(JSON.stringify({ error: "Route not found" }), { status: 404, headers: CORS_HEADERS });
+    return new Response(JSON.stringify({ error: "Endpoint not found" }), { status: 404, headers: CORS_HEADERS });
   }
 };
