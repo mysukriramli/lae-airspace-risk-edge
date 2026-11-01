@@ -1,6 +1,5 @@
 /**
- * Generates an immutable, non-repudiable SHA-256 witness certificate.
- * Uses native WebCrypto execution accelerated directly on CPU hardware registers.
+ * Generates an immutable, canonical SHA-256 flight clearance witness certificate.
  */
 export async function generateClearanceHash(payload) {
   const canonicalString = JSON.stringify({
@@ -11,6 +10,7 @@ export async function generateClearanceHash(payload) {
     approved_band: payload.approved_altitude_band,
     airspace: payload.airspace_constraint?.zone_id || "UNCONTROLLED",
     density_alt: payload.atmospheric_profile?.density_altitude_m,
+    c2: payload.c2_telecommunications_profile?.c2_link_safety,
     evaluated_at: payload.evaluated_at_utc
   });
 
