@@ -3,14 +3,18 @@ import {
   calculateAeroWindProfile, 
   calculateDensityAltitude, 
   calculateGroundRiskClass, 
-  resolveSafeAltitudeBand,
-  calculateBearingDeg,
-  resolveRelativeWindVector,
-  evaluateC2LinkRisk
+  resolveSafeAltitudeBand, 
+  resolveRelativeWindVector, 
+  evaluateC2LinkRisk 
 } from "./physics.js";
 import { fetchSurfaceAeroMeteo } from "./sensors.js";
 import { generateClearanceHash } from "./crypto.js";
-import { checkAirspaceRestrictions, getTerrainElevationM } from "./airspace.js";
+import { checkAirspaceRestrictions } from "./airspace.js";
+import { getTerrainElevationM, estimateUrbanCanopyHeightM, checkDynamicTFRs } from "./obstacles.js";
+import { validateEnterpriseToken } from "./auth.js";
+import { calculateBearingDeg } from "./conformance.js";
+
+export { AirspaceCorridorDO } from "./durable_object.js";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -20,71 +24,8 @@ const CORS_HEADERS = {
 };
 
 const H3_RES = 8; // ~460m hexagonal sector diameter
+const H3_DISTRICT_RES = 6; // ~36 km² regional cluster for Durable Object partitioning
 
-/**
- * In-Memory 4D Spatiotemporal Reservation Registry (ASTM F3548 UTM)
- * Partition key: h3_cell:altitude_bin:epoch_time_slot_30s
- */
-const ACTIVE_4D_RESERVATIONS = new Map();
-
-function cleanExpiredReservations() {
-  const now = Date.now();
-  for (const [key, record] of ACTIVE_4D_RESERVATIONS.entries()) {
-    if (record.expiresAt < now) {
-      ACTIVE_4D_RESERVATIONS.delete(key);
-    }
-  }
-}
-
-function check4DConflicts(cells, altitudeM, startIso, endIso, missionId) {
-  cleanExpiredReservations();
-  const startTime = new Date(startIso).getTime();
-  const endTime = new Date(endIso).getTime();
-  const altBin = Math.floor(altitudeM / 30) * 30; // 30-meter vertical separation slices
-
-  for (const cell of cells) {
-    for (let t = startTime; t <= endTime; t += 30000) {
-      const slotBin = Math.floor(t / 30000) * 30000;
-      const key = `${cell}:${altBin}:${slotBin}`;
-      const existing = ACTIVE_4D_RESERVATIONS.get(key);
-
-      if (existing && existing.missionId !== missionId) {
-        return {
-          conflict: true,
-          conflicting_mission_id: existing.missionId,
-          conflict_h3_cell: cell,
-          altitude_bin_m: `${altBin}-${altBin + 30}m`,
-          time_slot_utc: new Date(slotBin).toISOString(),
-          recommended_action: "ADVISE_DEPARTURE_DELAY_60S"
-        };
-      }
-    }
-  }
-
-  return { conflict: false };
-}
-
-function commit4DReservation(cells, altitudeM, startIso, endIso, missionId, priorityTier = "COMMERCIAL_LOGISTICS") {
-  const startTime = new Date(startIso).getTime();
-  const endTime = new Date(endIso).getTime();
-  const altBin = Math.floor(altitudeM / 30) * 30;
-
-  for (const cell of cells) {
-    for (let t = startTime; t <= endTime; t += 30000) {
-      const slotBin = Math.floor(t / 30000) * 30000;
-      const key = `${cell}:${altBin}:${slotBin}`;
-      ACTIVE_4D_RESERVATIONS.set(key, {
-        missionId,
-        priorityTier,
-        expiresAt: endTime + 60000
-      });
-    }
-  }
-}
-
-/**
- * Evaluates single waypoint clearance with terrain DEM, C2 link risk, and vector aerodynamics
- */
 async function evaluatePointClearance(lat, lon, params = {}) {
   const h3Cell = latLngToCell(lat, lon, H3_RES);
   const altRequestedAgl = parseFloat(params.alt_m || "60");
@@ -95,9 +36,22 @@ async function evaluatePointClearance(lat, lon, params = {}) {
   const bearing = params.bearing_deg !== undefined ? parseFloat(params.bearing_deg) : null;
   const m2Mitigation = params.m2_ground_mitigation === "true" || params.m2_ground_mitigation === true;
 
-  // 1. Terrain DEM & True AGL Separation
-  const terrainElevationM = await getTerrainElevationM(lat, lon);
-  const trueAltitudeAmsl = terrainElevationM + altRequestedAgl;
+  // 1. Dynamic TFR / NOTAM Validation
+  const tfrCheck = checkDynamicTFRs(lat, lon, altRequestedAgl);
+  if (tfrCheck.active_tfr_found) {
+    const tfrPayload = {
+      request_coordinates: { latitude: lat, longitude: lon },
+      h3_index_res8: h3Cell,
+      clearance_status: "DENIED_TEMPORARY_FLIGHT_RESTRICTION",
+      operational_reasoning: `Flight intersects active emergency/VIP geofence: ${tfrCheck.tfr_name} (${tfrCheck.tfr_id}). Reason: ${tfrCheck.reason}.`,
+      reroute_required: true,
+      tfr_constraint: tfrCheck,
+      approved_altitude_band: null,
+      evaluated_at_utc: new Date().toISOString()
+    };
+    tfrPayload.mission_certificate = await generateClearanceHash(tfrPayload);
+    return tfrPayload;
+  }
 
   // 2. Airspace Restriction Check
   const airspace = await checkAirspaceRestrictions(lat, lon, altRequestedAgl);
@@ -106,7 +60,7 @@ async function evaluatePointClearance(lat, lon, params = {}) {
       request_coordinates: { latitude: lat, longitude: lon },
       h3_index_res8: h3Cell,
       clearance_status: "DENIED_RESTRICTED_AIRSPACE",
-      operational_reasoning: `Corridor penetrates controlled airspace: ${airspace.zone_name} (${airspace.zone_id}). Distance: ${airspace.distance_to_center_km} km (Separation required: ${airspace.minimum_separation_km} km).`,
+      operational_reasoning: `Corridor penetrates controlled aerodrome CTR: ${airspace.zone_name} (${airspace.zone_id}). Distance: ${airspace.distance_to_center_km} km (Separation required: ${airspace.minimum_separation_km} km).`,
       reroute_required: true,
       airspace_constraint: airspace,
       approved_altitude_band: null,
@@ -116,7 +70,27 @@ async function evaluatePointClearance(lat, lon, params = {}) {
     return deniedPayload;
   }
 
-  // 3. Meteorological Telemetry Check
+  // 3. Terrain DEM & 3D Building Canopy (DSM) Obstacle Floor
+  const terrainElevationM = await getTerrainElevationM(lat, lon);
+  const urbanCanopy = estimateUrbanCanopyHeightM(terrainType);
+  const trueAltitudeAmsl = terrainElevationM + altRequestedAgl;
+
+  if (altRequestedAgl < urbanCanopy.minimum_safe_cruise_alt_agl_m) {
+    const obstaclePayload = {
+      request_coordinates: { latitude: lat, longitude: lon },
+      h3_index_res8: h3Cell,
+      clearance_status: "DENIED_OBSTACLE_CLEARANCE_VIOLATION",
+      operational_reasoning: `Requested altitude (${altRequestedAgl}m AGL) penetrates 3D urban canopy floor. Minimum certified clearance for ${terrainType} is ${urbanCanopy.minimum_safe_cruise_alt_agl_m}m AGL.`,
+      reroute_required: true,
+      obstacle_profile: urbanCanopy,
+      approved_altitude_band: { min_m: urbanCanopy.minimum_safe_cruise_alt_agl_m, max_m: 120 },
+      evaluated_at_utc: new Date().toISOString()
+    };
+    obstaclePayload.mission_certificate = await generateClearanceHash(obstaclePayload);
+    return obstaclePayload;
+  }
+
+  // 4. Atmospheric Telemetry
   const meteo = await fetchSurfaceAeroMeteo(lat, lon);
   if (!meteo.valid) {
     const deferredPayload = {
@@ -125,7 +99,6 @@ async function evaluatePointClearance(lat, lon, params = {}) {
       clearance_status: "DEFER_TELEMETRY_UNAVAILABLE",
       operational_reasoning: `Upstream weather observations offline. Clearance deferred under fail-safe rules: ${meteo.error_message}`,
       reroute_required: true,
-      airspace_constraint: airspace,
       approved_altitude_band: null,
       evaluated_at_utc: new Date().toISOString()
     };
@@ -133,17 +106,18 @@ async function evaluatePointClearance(lat, lon, params = {}) {
     return deferredPayload;
   }
 
-  // 4. Physical Calculations
+  // 5. Environmental Physics Calculations
   const density = calculateDensityAltitude(meteo.temperature_c, meteo.surface_pressure_hpa, altRequestedAgl);
   const aeroWind = calculateAeroWindProfile(meteo.wind_speed_10m_ms, meteo.wind_gusts_10m_ms, altRequestedAgl, terrainType);
   const sora = calculateGroundRiskClass(droneMassKg, density.air_density_kg_m3, "populated_urban", m2Mitigation);
   const c2Profile = evaluateC2LinkRisk(altRequestedAgl);
   const viableBand = resolveSafeAltitudeBand(
-    meteo.wind_speed_10m_ms, 
-    meteo.wind_gusts_10m_ms, 
-    maxVehicleWindMs, 
-    maxVehicleGustMs, 
-    terrainType
+    meteo.wind_speed_10m_ms,
+    meteo.wind_gusts_10m_ms,
+    maxVehicleWindMs,
+    maxVehicleGustMs,
+    terrainType,
+    urbanCanopy.minimum_safe_cruise_alt_agl_m
   );
 
   let vectorAerodynamics = null;
@@ -151,9 +125,9 @@ async function evaluatePointClearance(lat, lon, params = {}) {
     vectorAerodynamics = resolveRelativeWindVector(aeroWind.steady_wind_at_alt_ms, meteo.wind_direction_deg, bearing);
   }
 
-  // 5. Decision Matrix
+  // 6. Decision Matrix
   let status = "CLEARED_GREEN";
-  let reason = "All aerodynamic, airspace, and kinetic parameters within certified limits.";
+  let reason = "All aerodynamic, obstacle, airspace, and kinetic parameters within certified limits.";
   let rerouteRequired = false;
 
   if (aeroWind.peak_gust_at_alt_ms > maxVehicleGustMs) {
@@ -186,7 +160,8 @@ async function evaluatePointClearance(lat, lon, params = {}) {
     altitude_profile: {
       requested_alt_agl_m: altRequestedAgl,
       terrain_elevation_amsl_m: terrainElevationM,
-      calculated_flight_amsl_m: trueAltitudeAmsl
+      calculated_flight_amsl_m: trueAltitudeAmsl,
+      obstacle_canopy_floor_m: urbanCanopy.minimum_safe_cruise_alt_agl_m
     },
     approved_altitude_band: viableBand,
     airspace_constraint: airspace,
@@ -224,9 +199,6 @@ async function evaluatePointClearance(lat, lon, params = {}) {
   return payload;
 }
 
-/**
- * Evaluates flight corridor trajectory across sequential waypoints
- */
 async function evaluateCorridorClearance(waypoints, altRequested = 60, mass = 5.5, maxWind = 12.0, maxGust = 16.2) {
   const uniqueCells = new Map();
 
@@ -237,7 +209,6 @@ async function evaluateCorridorClearance(waypoints, altRequested = 60, mass = 5.
     if (i < waypoints.length - 1) {
       bearing = calculateBearingDeg(wp[0], wp[1], waypoints[i + 1][0], waypoints[i + 1][1]);
     }
-
     if (!uniqueCells.has(cell)) {
       uniqueCells.set(cell, { lat: wp[0], lon: wp[1], cell, bearing });
     }
@@ -254,7 +225,6 @@ async function evaluateCorridorClearance(waypoints, altRequested = 60, mass = 5.
   );
 
   const corridorResults = await Promise.all(cellPromises);
-
   let overallCleared = true;
   let bottleneckReason = null;
   let bottleneckStatus = "CLEARED_CORRIDOR";
@@ -290,10 +260,15 @@ export default {
   async fetch(request, env, ctx) {
     if (request.method === "OPTIONS") return new Response(null, { headers: CORS_HEADERS });
 
+    const auth = validateEnterpriseToken(request, env);
+    if (!auth.authorized) {
+      return new Response(JSON.stringify({ error: auth.error }), { status: 401, headers: CORS_HEADERS });
+    }
+
     const url = new URL(request.url);
     const { pathname, searchParams } = url;
 
-    // 1. Model Context Protocol (MCP) JSON-RPC 2.0 Handler
+    // 1. Model Context Protocol (MCP) Endpoint
     if (pathname === "/mcp" && request.method === "POST") {
       try {
         const rpc = await request.json();
@@ -306,17 +281,9 @@ export default {
             result: {
               protocolVersion: "2024-11-05",
               capabilities: { tools: {} },
-              serverInfo: { name: "lae-airspace-risk-edge", version: "2.2.0" }
+              serverInfo: { name: "lae-airspace-risk-edge", version: "3.0.0" }
             }
           }), { headers: CORS_HEADERS });
-        }
-
-        if (method === "notifications/initialized") {
-          return new Response(null, { status: 204, headers: CORS_HEADERS });
-        }
-
-        if (method === "ping") {
-          return new Response(JSON.stringify({ jsonrpc: "2.0", id, result: {} }), { headers: CORS_HEADERS });
         }
 
         if (method === "tools/list") {
@@ -327,35 +294,28 @@ export default {
               tools: [
                 {
                   name: "evaluate_airspace_clearance",
-                  description: "Evaluates low-altitude flight clearance, aerodrome geofencing, terrain AGL clearance, wind shear, C2 link quality, and SORA GRC.",
+                  description: "Evaluates low-altitude flight clearance, aerodrome geofencing, terrain/canopy obstacles, wind shear, and SORA GRC.",
                   inputSchema: {
                     type: "object",
                     properties: {
-                      lat: { type: "number", description: "Target latitude" },
-                      lon: { type: "number", description: "Target longitude" },
-                      alt_m: { type: "number", default: 60, description: "Planned altitude AGL in meters" },
-                      drone_mass_kg: { type: "number", default: 5.5, description: "Total takeoff mass in kg" },
-                      max_wind_limit_ms: { type: "number", default: 12.0, description: "Max steady wind rating in m/s" },
-                      bearing_deg: { type: "number", description: "Forward flight bearing in degrees (0-360)" },
-                      m2_ground_mitigation: { type: "boolean", default: false, description: "Whether SORA M2 ground impact mitigation area is secured" }
+                      lat: { type: "number" },
+                      lon: { type: "number" },
+                      alt_m: { type: "number", default: 60 },
+                      drone_mass_kg: { type: "number", default: 5.5 },
+                      max_wind_limit_ms: { type: "number", default: 12.0 },
+                      terrain: { type: "string", enum: ["water", "open_field", "suburban", "urban_canyon"] }
                     },
                     required: ["lat", "lon"]
                   }
                 },
                 {
                   name: "evaluate_corridor_clearance",
-                  description: "Evaluates an entire flight corridor trajectory over an array of waypoints, calculating crosswinds and aggregate clearance proof.",
+                  description: "Evaluates full corridor trajectory across multiple waypoints.",
                   inputSchema: {
                     type: "object",
                     properties: {
-                      waypoints: {
-                        type: "array",
-                        items: { type: "array", items: { type: "number" } },
-                        description: "Array of [lat, lon] coordinates."
-                      },
-                      alt_m: { type: "number", default: 60 },
-                      drone_mass_kg: { type: "number", default: 5.5 },
-                      max_wind_limit_ms: { type: "number", default: 12.0 }
+                      waypoints: { type: "array", items: { type: "array", items: { type: "number" } } },
+                      alt_m: { type: "number", default: 60 }
                     },
                     required: ["waypoints"]
                   }
@@ -379,13 +339,7 @@ export default {
           }
 
           if (toolName === "evaluate_corridor_clearance") {
-            const result = await evaluateCorridorClearance(
-              args.waypoints, 
-              args.alt_m, 
-              args.drone_mass_kg, 
-              args.max_wind_limit_ms, 
-              args.max_gust_limit_ms
-            );
+            const result = await evaluateCorridorClearance(args.waypoints, args.alt_m, args.drone_mass_kg, args.max_wind_limit_ms);
             return new Response(JSON.stringify({
               jsonrpc: "2.0",
               id,
@@ -393,24 +347,12 @@ export default {
             }), { headers: CORS_HEADERS });
           }
 
-          return new Response(JSON.stringify({
-            jsonrpc: "2.0",
-            id,
-            error: { code: -32601, message: `Tool '${toolName}' not found.` }
-          }), { status: 404, headers: CORS_HEADERS });
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32601, message: "Tool not found" } }), { status: 404, headers: CORS_HEADERS });
         }
 
-        return new Response(JSON.stringify({
-          jsonrpc: "2.0",
-          id,
-          error: { code: -32600, message: `Unsupported method '${method}'.` }
-        }), { status: 400, headers: CORS_HEADERS });
-
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32600, message: "Unsupported method" } }), { status: 400, headers: CORS_HEADERS });
       } catch (err) {
-        return new Response(JSON.stringify({
-          jsonrpc: "2.0",
-          error: { code: -32700, message: `Parse error: ${err.message}` }
-        }), { status: 500, headers: CORS_HEADERS });
+        return new Response(JSON.stringify({ jsonrpc: "2.0", error: { code: -32700, message: err.message } }), { status: 500, headers: CORS_HEADERS });
       }
     }
 
@@ -418,15 +360,15 @@ export default {
     if (pathname === "/" || pathname === "/llms.txt") {
       return new Response(JSON.stringify({
         service: "lae-airspace-risk-edge",
-        version: "2.2.0",
-        purpose: "Mission Clearance Authority & 4D Spatiotemporal UTM Deconfliction Engine",
-        mcp_endpoint: "POST /mcp",
+        version: "3.0.0",
+        purpose: "Enterprise Mission Clearance Authority, Distributed Durable 4D UTM, and In-Flight Conformance Monitoring",
         endpoints: {
-          single_clearance: "GET /v1/clearance?lat={lat}&lon={lon}&alt_m={alt}&bearing_deg={deg}",
+          single_clearance: "GET /v1/clearance?lat={lat}&lon={lon}&alt_m={alt}",
           corridor_clearance: "POST /v1/clearance-corridor",
-          reserve_corridor_4d: "POST /v1/reserve-corridor"
+          durable_reserve_4d: "POST /v1/reserve-corridor",
+          in_flight_telemetry: "POST /v1/conformance/telemetry"
         },
-        regulatory_standards: "ASTM F3548 UTM + ICAO CTR + JARUS SORA v2.5"
+        regulatory_standards: "ASTM F3548 UTM + ICAO Annex 2/11 + JARUS SORA v2.5"
       }, null, 2), { headers: CORS_HEADERS });
     }
 
@@ -436,29 +378,23 @@ export default {
       const lon = parseFloat(searchParams.get("lon"));
 
       if (isNaN(lat) || isNaN(lon)) {
-        return new Response(JSON.stringify({ error: "Missing required numeric 'lat' and 'lon' query parameters" }), {
-          status: 400,
-          headers: CORS_HEADERS
-        });
+        return new Response(JSON.stringify({ error: "Missing required 'lat' and 'lon' query parameters" }), { status: 400, headers: CORS_HEADERS });
       }
 
       const h3Cell = latLngToCell(lat, lon, H3_RES);
       const alt = searchParams.get("alt_m") || "60";
       const mass = searchParams.get("drone_mass_kg") || "5.5";
-      const bearing = searchParams.get("bearing_deg") || "0";
+      const terrain = searchParams.get("terrain") || "suburban";
 
       const cache = caches.default;
-      const cacheUrl = new URL(`https://lae-cache.internal/v22/cells/${h3Cell}?alt=${alt}&mass=${mass}&b=${bearing}`);
+      const cacheUrl = new URL(`https://lae-cache.internal/v3/cells/${h3Cell}?alt=${alt}&mass=${mass}&t=${terrain}`);
       const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
 
       const cached = await cache.match(cacheKey);
       if (cached) {
         const body = await cached.json();
         body.cache_status = "HIT_EDGE";
-        return new Response(JSON.stringify(body, null, 2), {
-          status: 200,
-          headers: { ...CORS_HEADERS, "X-Edge-Cache": "HIT" }
-        });
+        return new Response(JSON.stringify(body, null, 2), { status: 200, headers: { ...CORS_HEADERS, "X-Edge-Cache": "HIT" } });
       }
 
       const evaluation = await evaluatePointClearance(lat, lon, Object.fromEntries(searchParams));
@@ -466,18 +402,14 @@ export default {
 
       const res = new Response(JSON.stringify(evaluation, null, 2), {
         status: 200,
-        headers: {
-          ...CORS_HEADERS,
-          "Cache-Control": "public, max-age=180",
-          "X-Edge-Cache": "MISS"
-        }
+        headers: { ...CORS_HEADERS, "Cache-Control": "public, max-age=180", "X-Edge-Cache": "MISS" }
       });
 
       ctx.waitUntil(cache.put(cacheKey, res.clone()));
       return res;
     }
 
-    // 4. REST Flight Corridor Batch Evaluation
+    // 4. REST Corridor Evaluation
     if (pathname === "/v1/clearance-corridor" && request.method === "POST") {
       try {
         const body = await request.json();
@@ -488,66 +420,94 @@ export default {
         const maxGust = body.max_gust_limit_ms || (maxWind * 1.35);
 
         if (!Array.isArray(waypoints) || waypoints.length === 0) {
-          return new Response(JSON.stringify({ error: "Provide a 'waypoints' array: [[lat, lon], ...]" }), {
-            status: 400,
-            headers: CORS_HEADERS
-          });
+          return new Response(JSON.stringify({ error: "Provide a 'waypoints' array: [[lat, lon], ...]" }), { status: 400, headers: CORS_HEADERS });
         }
 
         const corridorEvaluation = await evaluateCorridorClearance(waypoints, altRequested, mass, maxWind, maxGust);
         return new Response(JSON.stringify(corridorEvaluation, null, 2), { headers: CORS_HEADERS });
       } catch (err) {
-        return new Response(JSON.stringify({ error: "Malformed corridor payload", details: err.message }), {
-          status: 400,
-          headers: CORS_HEADERS
-        });
+        return new Response(JSON.stringify({ error: "Malformed corridor payload", details: err.message }), { status: 400, headers: CORS_HEADERS });
       }
     }
 
-    // 5. REST 4D Spatiotemporal Corridor Reservation (ASTM F3548 Strategic Deconfliction)
+    // 5. Distributed ACID 4D Corridor Reservation via Cloudflare Durable Object
     if (pathname === "/v1/reserve-corridor" && request.method === "POST") {
       try {
         const body = await request.json();
         const { waypoints, alt_m = 60, time_start_utc, time_end_utc, mission_id, priority_tier } = body;
 
         if (!waypoints || !time_start_utc || !time_end_utc || !mission_id) {
-          return new Response(JSON.stringify({
-            error: "Missing required fields: 'waypoints', 'alt_m', 'time_start_utc', 'time_end_utc', 'mission_id'"
-          }), { status: 400, headers: CORS_HEADERS });
+          return new Response(JSON.stringify({ error: "Missing required fields: 'waypoints', 'alt_m', 'time_start_utc', 'time_end_utc', 'mission_id'" }), { status: 400, headers: CORS_HEADERS });
         }
 
+        // Partition by anchor H3 Res-6 district (~36 km²) to coordinate spatiotemporal slots without race conditions
+        const anchorCell = latLngToCell(waypoints[0][0], waypoints[0][1], H3_DISTRICT_RES);
         const cells = Array.from(new Set(waypoints.map(wp => latLngToCell(wp[0], wp[1], H3_RES))));
-        const conflictCheck = check4DConflicts(cells, alt_m, time_start_utc, time_end_utc, mission_id);
 
-        if (conflictCheck.conflict) {
+        const doId = env.AIRSPACE_DO.idFromName(anchorCell);
+        const doStub = env.AIRSPACE_DO.get(doId);
+
+        const doResponse = await doStub.fetch("https://do.internal/reserve", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cells, alt_m, time_start_utc, time_end_utc, mission_id, priority_tier, waypoints })
+        });
+
+        const doResult = await doResponse.json();
+
+        if (doResult.conflict) {
           return new Response(JSON.stringify({
             reservation_status: "CONFLICT_DETECTED",
-            conflict_details: conflictCheck
+            conflict_details: doResult
           }, null, 2), { status: 409, headers: CORS_HEADERS });
         }
-
-        commit4DReservation(cells, alt_m, time_start_utc, time_end_utc, mission_id, priority_tier);
 
         return new Response(JSON.stringify({
           reservation_status: "CONFIRMED_4D_RESERVED",
           mission_id,
-          reserved_h3_cells_count: cells.length,
+          district_partition: anchorCell,
+          allocated_cells_count: doResult.allocated_slots,
           altitude_band_m: `${Math.floor(alt_m / 30) * 30}-${Math.floor(alt_m / 30) * 30 + 30}m`,
           window_start: time_start_utc,
           window_end: time_end_utc,
           reservation_witness: await generateClearanceHash({
             request_coordinates: waypoints[0],
             h3_index_res8: cells.join(":"),
-            status: "RESERVED_4D",
+            status: "RESERVED_4D_DURABLE",
             evaluated_at: new Date().toISOString()
           })
         }, null, 2), { headers: CORS_HEADERS });
 
       } catch (err) {
-        return new Response(JSON.stringify({ error: "Failed to process 4D reservation", details: err.message }), {
-          status: 400,
-          headers: CORS_HEADERS
+        return new Response(JSON.stringify({ error: "Failed to process Durable 4D reservation", details: err.message }), { status: 400, headers: CORS_HEADERS });
+      }
+    }
+
+    // 6. In-Flight Live Conformance Monitoring Telemetry Ingestion
+    if (pathname === "/v1/conformance/telemetry" && request.method === "POST") {
+      try {
+        const body = await request.json();
+        const { mission_id, lat, lon, alt_agl_m, timestamp_utc } = body;
+
+        if (!mission_id || lat === undefined || lon === undefined || alt_agl_m === undefined) {
+          return new Response(JSON.stringify({ error: "Missing required telemetry fields: 'mission_id', 'lat', 'lon', 'alt_agl_m'" }), { status: 400, headers: CORS_HEADERS });
+        }
+
+        const anchorCell = latLngToCell(lat, lon, H3_DISTRICT_RES);
+        const doId = env.AIRSPACE_DO.idFromName(anchorCell);
+        const doStub = env.AIRSPACE_DO.get(doId);
+
+        const doResponse = await doStub.fetch("https://do.internal/telemetry", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ mission_id, lat, lon, alt_agl_m, timestamp_utc: timestamp_utc || new Date().toISOString() })
         });
+
+        const telemetryResult = await doResponse.json();
+        return new Response(JSON.stringify(telemetryResult, null, 2), { headers: CORS_HEADERS });
+
+      } catch (err) {
+        return new Response(JSON.stringify({ error: "Failed to process in-flight telemetry", details: err.message }), { status: 400, headers: CORS_HEADERS });
       }
     }
 
