@@ -1,20 +1,9 @@
 name = "lae-airspace-risk-edge"
-main = "src/index.js"
+main = "src/worker.js"
 compatibility_date = "2026-10-30"
 compatibility_flags = ["nodejs_compat"]
 
 [vars]
-SERVICE_VERSION = "3.0.0"
+SERVICE_VERSION = "3.1.0"
 ENVIRONMENT = "production"
 MAX_CORRIDOR_WAYPOINTS = "100"
-REQUIRE_API_KEY = "false"
-
-# Durable Object bindings for distributed, zero-race 4D spatiotemporal deconfliction
-[durable_objects]
-bindings = [
-  { name = "AIRSPACE_DO", class_name = "AirspaceCorridorDO" }
-]
-
-[[migrations]]
-tag = "v1"
-new_classes = ["AirspaceCorridorDO"]
