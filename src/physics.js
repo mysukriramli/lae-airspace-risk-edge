@@ -9,18 +9,13 @@ const P0_SEA_LEVEL_HPA = 1013.25;
 const R_SPECIFIC_AIR = 287.058;
 const GRAVITY = 9.80665;
 
-/**
- * Calculates local air density (rho in kg/m^3) and Density Altitude (meters).
- * Direct impact on drone rotor thrust efficiency and battery discharge rates.
- */
 export function calculateDensityAltitude(tempC, pressureHpa, altitudeAglM) {
   const tempK = tempC + 273.15;
   const pressurePa = pressureHpa * 100;
   const airDensity = pressurePa / (R_SPECIFIC_AIR * tempK);
-
   const pressureAltitudeM = (1 - Math.pow(pressureHpa / P0_SEA_LEVEL_HPA, 0.190284)) * 44307.69;
-  const standardTempAtAltC = 15 - (0.0065 * pressureAltitudeM);
-  const densityAltitudeM = pressureAltitudeM + (118.8 * (tempC - standardTempAtAltC));
+  const standardTempAtAltC = 15 - 0.0065 * pressureAltitudeM;
+  const densityAltitudeM = pressureAltitudeM + 118.8 * (tempC - standardTempAtAltC);
   const thrustEfficiencyFactor = Math.min(1.0, parseFloat((airDensity / 1.225).toFixed(3)));
 
   return {
@@ -30,14 +25,10 @@ export function calculateDensityAltitude(tempC, pressureHpa, altitudeAglM) {
   };
 }
 
-/**
- * Calculates steady wind shear and peak instantaneous gust shear at altitude z (m AGL).
- */
 export function calculateAeroWindProfile(surfaceWindMs, surfaceGustMs, altitudeAglM, terrainType = "suburban") {
   const alphaMean = SURFACE_ROUGHNESS[terrainType] ?? SURFACE_ROUGHNESS.suburban;
   const alphaGust = alphaMean * 0.55;
   const clampedAlt = Math.max(5, Math.min(altitudeAglM, 500));
-
   const windAtAlt = surfaceWindMs * Math.pow(clampedAlt / 10, alphaMean);
   const gustAtAlt = surfaceGustMs * Math.pow(clampedAlt / 10, alphaGust);
 
@@ -48,26 +39,6 @@ export function calculateAeroWindProfile(surfaceWindMs, surfaceGustMs, altitudeA
   };
 }
 
-/**
- * Calculates forward azimuth / bearing in degrees between two coordinates
- */
-export function calculateBearingDeg(lat1, lon1, lat2, lon2) {
-  const phi1 = (lat1 * Math.PI) / 180;
-  const phi2 = (lat2 * Math.PI) / 180;
-  const deltaLambda = ((lon2 - lon1) * Math.PI) / 180;
-
-  const y = Math.sin(deltaLambda) * Math.cos(phi2);
-  const x =
-    Math.cos(phi1) * Math.sin(phi2) -
-    Math.sin(phi1) * Math.cos(phi2) * Math.cos(deltaLambda);
-
-  const theta = Math.atan2(y, x);
-  return (theta * (180 / Math.PI) + 360) % 360;
-}
-
-/**
- * Decomposes wind vector relative to flight track bearing.
- */
 export function resolveRelativeWindVector(windSpeedMs, windDirDeg, trackBearingDeg, droneCruiseSpeedMs = 15.0) {
   const angleRad = ((windDirDeg - trackBearingDeg) * Math.PI) / 180;
   const headwindMs = parseFloat((windSpeedMs * Math.cos(angleRad)).toFixed(2));
@@ -90,9 +61,6 @@ export function resolveRelativeWindVector(windSpeedMs, windDirDeg, trackBearingD
   };
 }
 
-/**
- * Airborne 4G/5G Command & Control (C2) link safety model based on antenna sidelobes and cellular down-tilt.
- */
 export function evaluateC2LinkRisk(altitudeAglM) {
   if (altitudeAglM > 120) {
     return {
@@ -115,14 +83,9 @@ export function evaluateC2LinkRisk(altitudeAglM) {
   };
 }
 
-/**
- * JARUS SORA Kinetic Impact Energy and Ground Risk Class (GRC).
- * Incorporates SORA M2 Ground Mitigation: verified containment areas drop GRC class by 1.
- */
 export function calculateGroundRiskClass(droneMassKg, airDensity = 1.225, populationDensity = "populated_urban", m2MitigationApplied = false) {
   const cd = 1.15;
   const frontalArea = 0.05 * Math.pow(droneMassKg, 0.66);
-
   const terminalVelocity = Math.sqrt((2 * droneMassKg * GRAVITY) / (airDensity * frontalArea * cd));
   const kineticEnergyJoules = 0.5 * droneMassKg * Math.pow(terminalVelocity, 2);
 
@@ -148,13 +111,11 @@ export function calculateGroundRiskClass(droneMassKg, airDensity = 1.225, popula
   };
 }
 
-/**
- * Solves the certified vertical flight corridor (20m - 150m AGL).
- */
-export function resolveSafeAltitudeBand(surfaceWindMs, surfaceGustMs, maxVehicleWindMs, maxVehicleGustMs, terrainType) {
+export function resolveSafeAltitudeBand(surfaceWindMs, surfaceGustMs, maxVehicleWindMs, maxVehicleGustMs, terrainType, minSafeAltAgl = 20) {
   const validAlts = [];
+  const startAlt = Math.ceil(minSafeAltAgl / 10) * 10;
 
-  for (let z = 20; z <= 150; z += 10) {
+  for (let z = startAlt; z <= 150; z += 10) {
     const profile = calculateAeroWindProfile(surfaceWindMs, surfaceGustMs, z, terrainType);
     if (profile.steady_wind_at_alt_ms <= maxVehicleWindMs && profile.peak_gust_at_alt_ms <= maxVehicleGustMs) {
       validAlts.push(z);
