@@ -1,6 +1,3 @@
-/**
- * Generates an immutable, canonical SHA-256 flight clearance witness certificate.
- */
 export async function generateClearanceHash(payload) {
   const canonicalString = JSON.stringify({
     coords: payload.request_coordinates,
