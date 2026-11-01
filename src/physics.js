@@ -1,6 +1,3 @@
-/**
- * Global Terrain Roughness Classes (Hellmann exponent alpha)
- */
 export const SURFACE_ROUGHNESS = {
   water: 0.12,
   open_field: 0.16,
@@ -8,13 +5,9 @@ export const SURFACE_ROUGHNESS = {
   urban_canyon: 0.42
 };
 
-/**
- * Standard Atmospheric Constants (ICAO Standard Atmosphere)
- */
 const P0_SEA_LEVEL_HPA = 1013.25;
-const T0_SEA_LEVEL_K = 288.15; // 15 degrees Celsius
-const R_SPECIFIC_AIR = 287.058; // J/(kg·K)
-const GRAVITY = 9.80665; // m/s^2
+const R_SPECIFIC_AIR = 287.058;
+const GRAVITY = 9.80665;
 
 /**
  * Calculates local air density (rho in kg/m^3) and Density Altitude (meters).
@@ -23,18 +16,11 @@ const GRAVITY = 9.80665; // m/s^2
 export function calculateDensityAltitude(tempC, pressureHpa, altitudeAglM) {
   const tempK = tempC + 273.15;
   const pressurePa = pressureHpa * 100;
-  
-  // Real air density using ideal gas law: rho = P / (R * T)
   const airDensity = pressurePa / (R_SPECIFIC_AIR * tempK);
-  
-  // Standard temperature at current pressure altitude
+
   const pressureAltitudeM = (1 - Math.pow(pressureHpa / P0_SEA_LEVEL_HPA, 0.190284)) * 44307.69;
   const standardTempAtAltC = 15 - (0.0065 * pressureAltitudeM);
-  
-  // Density Altitude: approx. Pressure Altitude + 118.8 * (OAT - ISA Temp)
   const densityAltitudeM = pressureAltitudeM + (118.8 * (tempC - standardTempAtAltC));
-  
-  // Aerodynamic thrust penalty factor relative to standard sea-level air (1.225 kg/m^3)
   const thrustEfficiencyFactor = Math.min(1.0, parseFloat((airDensity / 1.225).toFixed(3)));
 
   return {
@@ -45,12 +31,11 @@ export function calculateDensityAltitude(tempC, pressureHpa, altitudeAglM) {
 }
 
 /**
- * Calculates both steady wind shear and peak instantaneous gust shear at altitude z (m AGL).
- * Gust exponent is typically ~50% of the mean wind exponent due to turbulent mixing.
+ * Calculates steady wind shear and peak instantaneous gust shear at altitude z (m AGL).
  */
 export function calculateAeroWindProfile(surfaceWindMs, surfaceGustMs, altitudeAglM, terrainType = "suburban") {
   const alphaMean = SURFACE_ROUGHNESS[terrainType] ?? SURFACE_ROUGHNESS.suburban;
-  const alphaGust = alphaMean * 0.55; 
+  const alphaGust = alphaMean * 0.55;
   const clampedAlt = Math.max(5, Math.min(altitudeAglM, 500));
 
   const windAtAlt = surfaceWindMs * Math.pow(clampedAlt / 10, alphaMean);
@@ -64,38 +49,107 @@ export function calculateAeroWindProfile(surfaceWindMs, surfaceGustMs, altitudeA
 }
 
 /**
- * JARUS SORA Kinetic Impact Energy Class (GRC)
- * Density-corrected terminal velocity calculation:
- * v_t = sqrt((2 * m * g) / (rho * A * Cd))
+ * Calculates forward azimuth / bearing in degrees between two coordinates
  */
-export function calculateGroundRiskClass(droneMassKg, airDensity = 1.225, populationDensity = "populated_urban") {
-  const cd = 1.15; // Realistic drag coefficient for tumbling unpowered multirotor
-  const frontalArea = 0.05 * Math.pow(droneMassKg, 0.66); // Projected impact area
+export function calculateBearingDeg(lat1, lon1, lat2, lon2) {
+  const phi1 = (lat1 * Math.PI) / 180;
+  const phi2 = (lat2 * Math.PI) / 180;
+  const deltaLambda = ((lon2 - lon1) * Math.PI) / 180;
 
-  const terminalVelocity = Math.sqrt((2 * droneMassKg * GRAVITY) / (airDensity * frontalArea * cd));
-  const kineticEnergyJoules = 0.5 * droneMassKg * Math.pow(terminalVelocity, 2);
+  const y = Math.sin(deltaLambda) * Math.cos(phi2);
+  const x =
+    Math.cos(phi1) * Math.sin(phi2) -
+    Math.sin(phi1) * Math.cos(phi2) * Math.cos(deltaLambda);
 
-  let grc = "GRC_1";
-  if (kineticEnergyJoules > 34000) {
-    grc = populationDensity === "populated_urban" ? "GRC_6" : "GRC_4";
-  } else if (kineticEnergyJoules > 1084) {
-    grc = populationDensity === "populated_urban" ? "GRC_4" : "GRC_3";
-  } else if (kineticEnergyJoules > 700) {
-    grc = populationDensity === "populated_urban" ? "GRC_3" : "GRC_2";
+  const theta = Math.atan2(y, x);
+  return (theta * (180 / Math.PI) + 360) % 360;
+}
+
+/**
+ * Decomposes wind vector relative to flight track bearing.
+ */
+export function resolveRelativeWindVector(windSpeedMs, windDirDeg, trackBearingDeg, droneCruiseSpeedMs = 15.0) {
+  const angleRad = ((windDirDeg - trackBearingDeg) * Math.PI) / 180;
+  const headwindMs = parseFloat((windSpeedMs * Math.cos(angleRad)).toFixed(2));
+  const crosswindMs = parseFloat(Math.abs(windSpeedMs * Math.sin(angleRad)).toFixed(2));
+  const groundSpeedMs = Math.max(1.0, droneCruiseSpeedMs - headwindMs);
+
+  let batteryReserveMultiplier = 1.0;
+  if (headwindMs > 0) {
+    batteryReserveMultiplier += (headwindMs / droneCruiseSpeedMs) * 0.45;
   } else {
-    grc = populationDensity === "populated_urban" ? "GRC_2" : "GRC_1";
+    batteryReserveMultiplier -= Math.min(0.2, (Math.abs(headwindMs) / droneCruiseSpeedMs) * 0.2);
   }
 
   return {
-    terminal_velocity_ms: parseFloat(terminalVelocity.toFixed(1)),
-    kinetic_impact_joules: Math.round(kineticEnergyJoules),
-    sora_ground_risk_class: grc
+    track_bearing_deg: Math.round(trackBearingDeg),
+    headwind_component_ms: headwindMs,
+    crosswind_component_ms: crosswindMs,
+    effective_ground_speed_ms: parseFloat(groundSpeedMs.toFixed(1)),
+    battery_reserve_margin_multiplier: parseFloat(batteryReserveMultiplier.toFixed(2))
   };
 }
 
 /**
- * Altitude Band Solver: Solves for the certified flight corridor (20m - 150m AGL).
- * Evaluates both steady wind and peak gust envelopes against vehicle limits.
+ * Airborne 4G/5G Command & Control (C2) link safety model based on antenna sidelobes and cellular down-tilt.
+ */
+export function evaluateC2LinkRisk(altitudeAglM) {
+  if (altitudeAglM > 120) {
+    return {
+      c2_link_safety: "POOR_SIDELOBE_INTERFERENCE",
+      handover_oscillation_risk: "HIGH",
+      recommended_action: "FORCE_LOCAL_WAYPOINT_INDEPENDENCE"
+    };
+  }
+  if (altitudeAglM > 75) {
+    return {
+      c2_link_safety: "MODERATE_ELEVATED_NOISE",
+      handover_oscillation_risk: "MEDIUM",
+      recommended_action: "MONITOR_PACKET_JITTER"
+    };
+  }
+  return {
+    c2_link_safety: "OPTIMAL",
+    handover_oscillation_risk: "LOW",
+    recommended_action: "NOMINAL"
+  };
+}
+
+/**
+ * JARUS SORA Kinetic Impact Energy and Ground Risk Class (GRC).
+ * Incorporates SORA M2 Ground Mitigation: verified containment areas drop GRC class by 1.
+ */
+export function calculateGroundRiskClass(droneMassKg, airDensity = 1.225, populationDensity = "populated_urban", m2MitigationApplied = false) {
+  const cd = 1.15;
+  const frontalArea = 0.05 * Math.pow(droneMassKg, 0.66);
+
+  const terminalVelocity = Math.sqrt((2 * droneMassKg * GRAVITY) / (airDensity * frontalArea * cd));
+  const kineticEnergyJoules = 0.5 * droneMassKg * Math.pow(terminalVelocity, 2);
+
+  let baselineGrcNumber = 1;
+  if (kineticEnergyJoules > 34000) {
+    baselineGrcNumber = populationDensity === "populated_urban" ? 6 : 4;
+  } else if (kineticEnergyJoules > 1084) {
+    baselineGrcNumber = populationDensity === "populated_urban" ? 4 : 3;
+  } else if (kineticEnergyJoules > 700) {
+    baselineGrcNumber = populationDensity === "populated_urban" ? 3 : 2;
+  } else {
+    baselineGrcNumber = populationDensity === "populated_urban" ? 2 : 1;
+  }
+
+  const finalGrcNumber = m2MitigationApplied ? Math.max(1, baselineGrcNumber - 1) : baselineGrcNumber;
+
+  return {
+    terminal_velocity_ms: parseFloat(terminalVelocity.toFixed(1)),
+    kinetic_impact_joules: Math.round(kineticEnergyJoules),
+    baseline_grc: `GRC_${baselineGrcNumber}`,
+    sora_ground_risk_class: `GRC_${finalGrcNumber}`,
+    m2_mitigation_applied: m2MitigationApplied
+  };
+}
+
+/**
+ * Solves the certified vertical flight corridor (20m - 150m AGL).
  */
 export function resolveSafeAltitudeBand(surfaceWindMs, surfaceGustMs, maxVehicleWindMs, maxVehicleGustMs, terrainType) {
   const validAlts = [];
