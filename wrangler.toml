@@ -4,7 +4,17 @@ compatibility_date = "2026-10-30"
 compatibility_flags = ["nodejs_compat"]
 
 [vars]
-SERVICE_VERSION = "2.2.0"
+SERVICE_VERSION = "3.0.0"
 ENVIRONMENT = "production"
 MAX_CORRIDOR_WAYPOINTS = "100"
-DEFAULT_ELEVATION_MASK_DEG = "10"
+REQUIRE_API_KEY = "false"
+
+# Durable Object bindings for distributed, zero-race 4D spatiotemporal deconfliction
+[durable_objects]
+bindings = [
+  { name = "AIRSPACE_DO", class_name = "AirspaceCorridorDO" }
+]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["AirspaceCorridorDO"]
