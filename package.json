@@ -1,0 +1,17 @@
+{
+  "name": "lae-airspace-risk-edge",
+  "version": "1.0.0",
+  "description": "Sub-millisecond Low-Altitude Economy (LAE) micro-weather clearance & SORA ground risk engine",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "h3-js": "^4.1.0"
+  },
+  "devDependencies": {
+    "wrangler": "^3.109.0"
+  }
+}
