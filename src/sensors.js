@@ -1,32 +1,46 @@
+/**
+ * Worldwide Aviation & Micro-Meteorology Ingestion Engine
+ * Extracts surface wind, instantaneous peak gusts, QNH pressure, and precipitation.
+ */
 export async function fetchSurfaceAeroMeteo(lat, lon) {
-  const endpoint = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,precipitation,wind_speed_10m,wind_gusts_10m,wind_direction_10m&wind_speed_unit=ms`;
+  const endpoint = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,surface_pressure,precipitation,wind_speed_10m,wind_gusts_10m,wind_direction_10m&wind_speed_unit=ms`;
 
   try {
     const res = await fetch(endpoint, {
-      headers: { "User-Agent": "LAE-Airspace-Risk-Edge/1.0" },
-      cf: { cacheTtl: 300, cacheEverything: true }
+      headers: { "User-Agent": "LAE-Airspace-Risk-Edge/2.0" },
+      cf: { cacheTtl: 180, cacheEverything: true }
     });
 
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (!res.ok) throw new Error(`Upstream weather returned HTTP ${res.status}`);
     const data = await res.json();
     const cur = data.current || {};
 
+    const windSpeed = cur.wind_speed_10m;
+    const windGusts = cur.wind_gusts_10m;
+    const pressure = cur.surface_pressure;
+    const temp = cur.temperature_2m;
+
+    if (windSpeed === undefined || pressure === undefined) {
+      throw new Error("Essential meteorological fields missing in upstream payload");
+    }
+
     return {
-      wind_speed_10m_ms: cur.wind_speed_10m ?? 2.5,
-      wind_gusts_10m_ms: cur.wind_gusts_10m ?? 4.0,
+      valid: true,
+      wind_speed_10m_ms: parseFloat(windSpeed.toFixed(2)),
+      wind_gusts_10m_ms: parseFloat((windGusts ?? (windSpeed * 1.35)).toFixed(2)),
       wind_direction_deg: cur.wind_direction_10m ?? 0,
+      surface_pressure_hpa: parseFloat(pressure.toFixed(1)),
+      temperature_c: parseFloat((temp ?? 25.0).toFixed(1)),
+      relative_humidity_pct: cur.relative_humidity_2m ?? 70,
       precipitation_mm_hr: cur.precipitation ?? 0.0,
-      temperature_c: cur.temperature_2m ?? 28.0,
-      source: "OPEN_METEO_AERO"
+      source: "OPEN_METEO_WMO_FEED"
     };
-  } catch {
+  } catch (err) {
+    // FAIL-SAFE: Do NOT fabricate low winds or zero rain. Return invalid flag.
     return {
-      wind_speed_10m_ms: 3.0,
-      wind_gusts_10m_ms: 5.0,
-      wind_direction_deg: 90,
-      precipitation_mm_hr: 0.0,
-      temperature_c: 28.0,
-      source: "FALLBACK_CLIMATOLOGY"
+      valid: false,
+      error_message: err.message,
+      source: "TELEMETRY_UNAVAILABLE"
     };
   }
 }
