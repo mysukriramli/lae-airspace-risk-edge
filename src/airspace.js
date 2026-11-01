@@ -26,35 +26,10 @@ function haversineKm(lat1, lon1, lat2, lon2) {
   const dLon = (lon2 - lon1) * (Math.PI / 180);
   const a =
     Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(lat1 * (Math.PI / 180)) *
-      Math.cos(lat2 * (Math.PI / 180)) *
-      Math.sin(dLon / 2) *
-      Math.sin(dLon / 2);
-  return R * (2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
+    Math.cos(lat1 * (Math.PI / 180)) * Math.cos(lat2 * (Math.PI / 180)) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-/**
- * Queries terrain surface elevation (meters Above Mean Sea Level) via open DEM.
- */
-export async function getTerrainElevationM(lat, lon) {
-  const url = `https://api.open-meteo.com/v1/elevation?latitude=${lat}&longitude=${lon}`;
-  try {
-    const res = await fetch(url, {
-      headers: { "User-Agent": "LAE-Airspace-Risk-Edge/2.2" },
-      cf: { cacheTtl: 86400 * 14, cacheEverything: true }
-    });
-    if (!res.ok) return 0.0;
-    const data = await res.json();
-    return data.elevation?.[0] ?? 0.0;
-  } catch {
-    return 0.0;
-  }
-}
-
-/**
- * Universal Global Airspace Authority.
- * Evaluates against embedded core hubs, then falls back to dynamic NOAA ICAO registry.
- */
 export async function checkAirspaceRestrictions(lat, lon, altitudeAglM) {
   const ICAO_CTR_RADIUS_KM = 9.26;
   const ICAO_CTR_CEILING_M = 1000;
@@ -85,7 +60,7 @@ export async function checkAirspaceRestrictions(lat, lon, altitudeAglM) {
 
   try {
     const res = await fetch(endpoint, {
-      headers: { "User-Agent": "LAE-Airspace-Risk-Edge/2.2" },
+      headers: { "User-Agent": "LAE-Airspace-Risk-Edge/3.0" },
       cf: { cacheTtl: 21600, cacheEverything: true }
     });
 
