@@ -1,13 +1,13 @@
 /**
- * Worldwide Aviation & Micro-Meteorology Ingestion Engine
- * Extracts surface wind, instantaneous peak gusts, QNH pressure, and precipitation.
+ * Worldwide Aviation & Micro-Meteorology Ingestion Engine.
+ * Strict fail-safe architecture: invalidates payload on missing fields.
  */
 export async function fetchSurfaceAeroMeteo(lat, lon) {
   const endpoint = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,surface_pressure,precipitation,wind_speed_10m,wind_gusts_10m,wind_direction_10m&wind_speed_unit=ms`;
 
   try {
     const res = await fetch(endpoint, {
-      headers: { "User-Agent": "LAE-Airspace-Risk-Edge/2.0" },
+      headers: { "User-Agent": "LAE-Airspace-Risk-Edge/2.2" },
       cf: { cacheTtl: 180, cacheEverything: true }
     });
 
@@ -36,7 +36,6 @@ export async function fetchSurfaceAeroMeteo(lat, lon) {
       source: "OPEN_METEO_WMO_FEED"
     };
   } catch (err) {
-    // FAIL-SAFE: Do NOT fabricate low winds or zero rain. Return invalid flag.
     return {
       valid: false,
       error_message: err.message,
